@@ -1,6 +1,11 @@
 import numpy as np
 
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Point
+
 from robot_tracking_project.kinematics import forward_kinematics, jacobian
+from robot_tracking_project.metrics import yoshikawa_manipulability
 
 
 def pseudoinverse_control(J, error, gain=1.0):
@@ -11,93 +16,123 @@ def dls_control(J, error, damping=0.1, gain=1.0):
     identity = np.eye(J.shape[0])
     return J.T @ np.linalg.inv(J @ J.T + (damping ** 2) * identity) @ (gain * error)
 
-def run_controller( mode='pinv', link_lengths=None, q_init=None, target=None, gain=1.0, 	 damping=0.1, dt=0.05, tolerance=0.01,max_steps=200,):
-	if link_lengths is None:
-        link_lengths = np.array([0.5, 0.7, 0.5], dtype=float)
-    else:
-        link_lengths = np.asarray(link_lengths, dtype=float)
 
-    if q_init is None:
-        q = np.array([0.2, 0.3, -0.2], dtype=float)
-    else:
-        q = np.asarray(q_init, dtype=float)
+class ControllerNode(Node):
+    def __init__(self,
+                 link_lengths=None,
+                 q_init=None,
+                 gain=1.0,
+                 damping=0.1,
+                 dt=0.05,
+                 tolerance=0.01,
+                 max_steps=200):
+        super().__init__('controller_node')
 
-    if target is None:
-        target = np.array([0.6, 0.2, 0.8], dtype=float)
-    else:
-        target = np.asarray(target, dtype=float)
+        self.q_init = (
+            np.array([0.2, 0.3, -0.2], dtype=float)
+            if q_init is None
+            else np.asarray(q_init, dtype=float)
+        )
+        self.link_lengths = (
+            np.array([0.5, 0.7, 0.5], dtype=float)
+            if link_lengths is None
+            else np.asarray(link_lengths, dtype=float)
+        )
+        self.gain = gain
+        self.damping = damping
+        self.dt = dt
+        self.tolerance = tolerance
+        self.max_steps = max_steps
 
-    if q.shape != (3,):
-        raise ValueError("q_init must be a length-3 vector.")
-    if link_lengths.shape != (3,):
-        raise ValueError("link_lengths must be a length-3 vector.")
-    if target.shape != (3,):
-        raise ValueError("target must be a length-3 vector.")
-    if dt <= 0:
-        raise ValueError("dt must be positive.")
-    if tolerance <= 0:
-        raise ValueError("tolerance must be positive.")
-    if max_steps <= 0:
-        raise ValueError("max_steps must be positive.")
-    if damping <= 0:
-        raise ValueError("damping must be positive for DLS.")
-        
-    positions = []
-    errors = []
-    q_history = [q.copy()]
-    qdot_history = []
+        self.target = None
 
-    for step in range(max_steps):
-        x = forward_kinematics(q, link_lengths)
-        error = target - x
-        error_norm = np.linalg.norm(error)
-        J = jacobian(q, link_lengths)
-
-        positions.append(x.copy())
-        errors.append(error_norm)
-
-        if error_norm < tolerance:
-            print(f"Target reached in {step} steps.")
-            break
-
-        if mode == 'pinv':
-            q_dot = pseudoinverse_control(J, error, gain=gain)
-        elif mode == 'dls':
-            q_dot = dls_control(J, error, damping=damping, gain=gain)
-        else:
-            raise ValueError("mode must be 'pinv' or 'dls'.")
-
-        q = q + q_dot * dt
-        q_history.append(q.copy())
-        qdot_history.append(q_dot.copy())
-
-        print(
-            f"Step {step:03d} | "
-            f"pos={x} | "
-            f"error_norm={error_norm:.6f} | "
-            f"q_dot={q_dot}"
+        self.subscription = self.create_subscription(
+            Point,
+            '/target_position',
+            self._target_callback,
+            10,
         )
 
-    return {
-        'final_q': q,
-        'final_position': forward_kinematics(q, link_lengths),
-        'positions': np.array(positions),
-        'errors': np.array(errors),
-        'q_history': np.array(q_history),
-        'qdot_history': np.array(qdot_history),
-    }
+        self.get_logger().info('ControllerNode started. Waiting for /target_position...')
+
+    def _target_callback(self, msg):
+        new_target = np.array([msg.x, msg.y, msg.z], dtype=float)
+        if self.target is not None and np.allclose(new_target, self.target):
+            return
+        self.target = new_target
+        self.get_logger().info(f'New target received: {new_target}. Running both controllers.')
+        pinv_error, pinv_pos = self._run_controller('pinv', self.target)
+        dls_error, dls_pos = self._run_controller('dls', self.target)
+        print(
+            f'\nFinal comparison:\n'
+            f'Pseudoinverse final position: {pinv_pos}\n'
+            f'Pseudoinverse final error: {pinv_error:.6f}\n'
+            f'DLS final position: {dls_pos}\n'
+            f'DLS final error: {dls_error:.6f}'
+        )
+
+    def _run_controller(self, mode, target):
+        label = 'Pseudoinverse' if mode == 'pinv' else 'DLS'
+        print(f'\n--- {label} Controller ---')
+        q = self.q_init.copy()
+        final_error = None
+        final_position = None
+
+        for step in range(self.max_steps):
+            x = forward_kinematics(q, self.link_lengths)
+            error = target - x
+            error_norm = np.linalg.norm(error)
+            J = jacobian(q, self.link_lengths)
+            manipulability = yoshikawa_manipulability(J)
+
+            final_error = error_norm
+            final_position = x.copy()
+
+            if error_norm < self.tolerance:
+                print(
+                    f"Step {step:03d} | "
+                    f"pos={x} | "
+                    f"error_norm={error_norm:.6f} | "
+                    f"manipulability={manipulability:.6f}"
+                )
+                break
+
+            if mode == 'pinv':
+                q_dot = pseudoinverse_control(J, error, gain=self.gain)
+            else:
+                q_dot = dls_control(J, error, damping=self.damping, gain=self.gain)
+
+            q = q + q_dot * self.dt
+
+            print(
+                f"Step {step:03d} | "
+                f"pos={x} | "
+                f"error_norm={error_norm:.6f} | "
+                f"manipulability={manipulability:.6f} | "
+                f"q_dot={q_dot}"
+            )
+
+        print(
+            f'\n{label} summary | '
+            f'steps={step} | '
+            f'final_error={final_error:.6f} | '
+            f'final_pos={final_position}'
+        )
+        return final_error, final_position
 
 
-def main():
-    print("\nRunning pseudoinverse controller:\n")
-    pinv_results = run_controller(mode='pinv')
+def main(args=None):
+    rclpy.init(args=args)
+    node = ControllerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
-    print("\nRunning DLS controller:\n")
-    dls_results = run_controller(mode='dls')
 
-    print("\nFinal comparison:")
-    print("Pseudoinverse final position:", pinv_results['final_position'])
-    print("Pseudoinverse final error:", pinv_results['errors'][-1] if 	len(pinv_results['errors']) else "N/A")
+if __name__ == '__main__':
+    main()
 
-    print("DLS final position:", dls_results['final_position'])
-    print("DLS final error:", dls_results['errors'][-1] if len(dls_results['errors']) else"N/A")

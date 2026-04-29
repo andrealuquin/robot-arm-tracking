@@ -11,9 +11,9 @@ class TargetPublisher(Node):
 
     def timer_callback(self):
         msg = Point()
-        msg.x = 0.5
+        msg.x = 0.6
         msg.y = 0.2
-        msg.z = 0.3
+        msg.z = 0.8
         self.publisher_.publish(msg)
 
 
