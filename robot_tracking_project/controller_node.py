@@ -11,6 +11,8 @@ def dls_control(J, error, damping=0.1, gain=1.0):
     identity = np.eye(J.shape[0])
     return J.T @ np.linalg.inv(J @ J.T + (damping ** 2) * identity) @ (gain * error)
 
+def run_controller( mode='pinv', link_lengths=None, q_init=None, target=None, gain=1.0, 	 damping=0.1, dt=0.05, tolerance=0.01,max_steps=200,):
+
 
 def main():
     link_lengths = [0.5, 0.7, 0.5]
