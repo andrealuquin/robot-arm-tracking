@@ -55,28 +55,54 @@ class ControllerNode(Node):
 
         self.get_logger().info('ControllerNode started. Waiting for /target_position...')
 
+    def _target_label(self, target):
+        if np.allclose(target, [0.6, 0.2, 0.8]):
+            return 'normal_case'
+        elif np.allclose(target, [0.5, 0.1, 0.75]):
+            return 'shifted_case'
+        elif np.allclose(target, [1.15, 0.0, 0.5]):
+            return 'stretched_case'
+        return 'unknown_case'
+
     def _target_callback(self, msg):
         new_target = np.array([msg.x, msg.y, msg.z], dtype=float)
+
         if self.target is not None and np.allclose(new_target, self.target):
             return
+
         self.target = new_target
-        self.get_logger().info(f'New target received: {new_target}. Running both controllers.')
-        pinv_error, pinv_pos = self._run_controller('pinv', self.target)
-        dls_error, dls_pos = self._run_controller('dls', self.target)
+        target_label = self._target_label(new_target)
+
+        self.get_logger().info(
+            f'New target received: {target_label} -> {new_target}. Running both controllers.'
+        )
+
+        pinv_results = self._run_controller('pinv', self.target)
+        dls_results = self._run_controller('dls', self.target)
+
         print(
             f'\nFinal comparison:\n'
-            f'Pseudoinverse final position: {pinv_pos}\n'
-            f'Pseudoinverse final error: {pinv_error:.6f}\n'
-            f'DLS final position: {dls_pos}\n'
-            f'DLS final error: {dls_error:.6f}'
+            f'Trial: {target_label}\n'
+            f'Target coordinates: {self.target}\n'
+            f'Pseudoinverse final position: {pinv_results["final_position"]}\n'
+            f'Pseudoinverse final error: {pinv_results["final_error"]:.6f}\n'
+            f'Pseudoinverse max qdot norm: {pinv_results["max_qdot_norm"]:.6f}\n'
+            f'Pseudoinverse final manipulability: {pinv_results["final_manipulability"]:.6f}\n'
+            f'DLS final position: {dls_results["final_position"]}\n'
+            f'DLS final error: {dls_results["final_error"]:.6f}\n'
+            f'DLS max qdot norm: {dls_results["max_qdot_norm"]:.6f}\n'
+            f'DLS final manipulability: {dls_results["final_manipulability"]:.6f}'
         )
 
     def _run_controller(self, mode, target):
         label = 'Pseudoinverse' if mode == 'pinv' else 'DLS'
         print(f'\n--- {label} Controller ---')
+
         q = self.q_init.copy()
         final_error = None
         final_position = None
+        final_manipulability = None
+        max_qdot_norm = 0.0
 
         for step in range(self.max_steps):
             x = forward_kinematics(q, self.link_lengths)
@@ -87,6 +113,7 @@ class ControllerNode(Node):
 
             final_error = error_norm
             final_position = x.copy()
+            final_manipulability = manipulability
 
             if error_norm < self.tolerance:
                 print(
@@ -102,6 +129,10 @@ class ControllerNode(Node):
             else:
                 q_dot = dls_control(J, error, damping=self.damping, gain=self.gain)
 
+            qdot_norm = np.linalg.norm(q_dot)
+            if qdot_norm > max_qdot_norm:
+                max_qdot_norm = qdot_norm
+
             q = q + q_dot * self.dt
 
             print(
@@ -116,9 +147,18 @@ class ControllerNode(Node):
             f'\n{label} summary | '
             f'steps={step} | '
             f'final_error={final_error:.6f} | '
+            f'max_qdot_norm={max_qdot_norm:.6f} | '
+            f'final_manipulability={final_manipulability:.6f} | '
             f'final_pos={final_position}'
         )
-        return final_error, final_position
+
+        return {
+            'final_error': final_error,
+            'final_position': final_position,
+            'max_qdot_norm': max_qdot_norm,
+            'final_manipulability': final_manipulability,
+            'steps': step,
+        }
 
 
 def main(args=None):
@@ -130,9 +170,9 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
     main()
-
